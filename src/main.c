@@ -10,8 +10,7 @@
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s -f <from> -t <to> [-s subject] [-b body] [-p port]\n"
-        "          [-H helo-host] <server>\n\n"
+        "Usage: %s -f <from> -t <to> [-s subject] [-b body] [-p port] [-H helo-host] <server>\n\n"
         "  -f <from>       envelope sender, e.g. you@example.com\n"
         "  -t <to>         envelope recipient\n"
         "  -s <subject>    subject line (default: empty)\n"
@@ -21,7 +20,7 @@ static void print_usage(const char *prog) {
         "  <server>        host name or address of the mail server\n", prog);
 }
 
-/* Slurp all of stdin into a malloc'd, NUL-terminated string. */
+/* Take all of stdin into a malloc, NULL-terminated string. */
 static char *read_stdin_body(void) {
     size_t cap = 4096, len = 0;
     char *buf = malloc(cap);
@@ -50,7 +49,7 @@ int main(int argc, char *argv[]) {
     const char *from = NULL, *to = NULL, *subject = "", *body_opt = NULL;
     const char *port = "25", *helo = "localhost";   /* spec defaults */
     int opt;
-    while ((opt = getopt(argc, argv, "f:t:s:b:p:H")) != -1) {
+    while ((opt = getopt(argc, argv, "f:t:s:b:p:H:")) != -1) {
         switch (opt) {
         case 'f': from    = optarg; break;
         case 't': to      = optarg; break;
