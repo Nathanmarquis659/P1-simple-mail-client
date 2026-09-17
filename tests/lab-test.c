@@ -608,11 +608,296 @@ void test_sock_connect_bad_host(void) {
     sock_close(&t);
 }
 
-void test_sock_close_empty_ctx(void) {
+void test_sock_close_empty_ctx(void)
+{
     transport_t t;
     memset(&t, 0, sizeof t);
     sock_close(&t);   /* NULL ctx: no-op */
     sock_close(&t);   /* double close: still safe */
+}
+
+/* ==== EXTRA COVERAGE TESTS v3 (built strictly against lab.h) ==== */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
+/* ---------- tiny scripted "server" implementing transport_t ----------
+ * read_line contract per header: -> line length, or -1 on EOF.     */
+typedef struct { const char *script; size_t pos; } x_srv;
+
+static int x_read_line(void *ctx, char *buf, size_t bufsz)
+{
+    x_srv *s = (x_srv *)ctx;
+    if (!s->script || !s->script[s->pos]) return -1;
+    const char *p   = s->script + s->pos;
+    const char *eol = strstr(p, "\r\n");
+    if (!eol) return -1;
+    size_t n = (size_t)(eol - p);
+    if (n >= bufsz) n = bufsz - 1;
+    memcpy(buf, p, n);
+    buf[n] = '\0';
+    s->pos += n + 2;
+    return (int)n;
+}
+
+static int x_write_all(void *ctx, const char *data, size_t n)
+{
+    (void)ctx; (void)data; (void)n;
+    return 0;   /* we test the session's decisions, not its bytes */
+}
+
+static transport_t x_mk(const char *script, x_srv *s)
+{
+    s->script = script;
+    s->pos    = 0;
+    transport_t t;
+    t.read_line = x_read_line;
+    t.write_all = x_write_all;
+    t.ctx       = s;
+    return t;
+}
+
+static mail_cfg_t x_cfg(void)
+{
+    mail_cfg_t c;
+    c.from      = "alice@example.com";
+    c.to        = "bob@example.com";
+    c.subject   = "hi";
+    c.body      = "Hello world";
+    c.helo_host = "localhost";
+    return c;
+}
+
+/* ================= run_session failure paths ================= */
+
+static void test_x_bad_greeting(void)
+{
+    x_srv s; transport_t t = x_mk("554 no\r\n", &s);
+    mail_cfg_t c = x_cfg();
+    TEST_ASSERT_NOT_EQUAL(0, run_session(&t, &c));
+}
+
+static void test_x_helo_rejected(void)
+{
+    x_srv s; transport_t t = x_mk("220 mta ready\r\n550 denied\r\n", &s);
+    mail_cfg_t c = x_cfg();
+    TEST_ASSERT_NOT_EQUAL(0, run_session(&t, &c));
+}
+
+static void test_x_mail_rejected(void)
+{
+    x_srv s; transport_t t = x_mk("220 mta ready\r\n250 ok\r\n550 no\r\n", &s);
+    mail_cfg_t c = x_cfg();
+    TEST_ASSERT_NOT_EQUAL(0, run_session(&t, &c));
+}
+
+static void test_x_rcpt_rejected(void)
+{
+    x_srv s; transport_t t = x_mk("220 mta ready\r\n250 ok\r\n250 ok\r\n550 no\r\n", &s);
+    mail_cfg_t c = x_cfg();
+    TEST_ASSERT_NOT_EQUAL(0, run_session(&t, &c));
+}
+
+static void test_x_data_rejected(void)
+{
+    x_srv s; transport_t t = x_mk("220 mta ready\r\n250 ok\r\n250 ok\r\n"
+                                  "250 ok\r\n451 busy\r\n", &s);
+    mail_cfg_t c = x_cfg();
+    TEST_ASSERT_NOT_EQUAL(0, run_session(&t, &c));
+}
+
+static void test_x_garbage_reply(void)
+{
+    x_srv s; transport_t t = x_mk("220 mta ready\r\nXYZ broken\r\n", &s);
+    mail_cfg_t c = x_cfg();
+    TEST_ASSERT_NOT_EQUAL(0, run_session(&t, &c));
+}
+
+static void test_x_hangup_mid_session(void)
+{
+    /* greeting is fine, then the "server" goes silent */
+    x_srv s; transport_t t = x_mk("220 mta ready\r\n", &s);
+    mail_cfg_t c = x_cfg();
+    TEST_ASSERT_NOT_EQUAL(0, run_session(&t, &c));
+}
+
+/* ================= pure-helper edge branches ================= */
+
+static void test_x_parse_bad(void)
+{
+    TEST_ASSERT_EQUAL_INT(-1, parse_reply_code("XYZ no"));
+    TEST_ASSERT_EQUAL_INT(-1, parse_reply_code("25x ok"));
+}
+
+static void test_x_dot_stuff_edges(void)
+{
+    char *p;
+    p = dot_stuff("", 0);              /* empty body */
+    TEST_ASSERT_NOT_NULL(p);
+    free(p);
+
+    p = dot_stuff(".hidden", 7);       /* single leading dot doubled */
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_TRUE(strstr(p, "..hidden") != NULL);
+    free(p);
+
+    p = dot_stuff("..", 2);            /* multi-dot line: the cold branch */
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_TRUE(strstr(p, "...") != NULL);
+    free(p);
+}
+
+static void test_x_build_payload_edges(void)
+{
+    char *p;
+    p = build_data_payload("a@b", "c@d", "", "body\r\n");   /* empty subject */
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_TRUE(strstr(p, "a@b") != NULL);
+    free(p);
+
+    p = build_data_payload("a@b", "c@d", "s", "");          /* empty body */
+    TEST_ASSERT_NOT_NULL(p);
+    free(p);
+}
+
+/* ================= Layer 3 over a real loopback socket =================
+ * sock_connect(host, port, &t) installs the callbacks per its signature,
+ * so we drive the private read/write functions through t.              */
+static char x_port[8];
+
+static int x_listen_port(void)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port        = 0;                       /* kernel picks port */
+    if (bind(lfd, (struct sockaddr *)&a, sizeof(a)) != 0) return -1;
+    if (listen(lfd, 1) != 0) { close(lfd); return -1; }
+    socklen_t sl = sizeof(a);
+    getsockname(lfd, (struct sockaddr *)&a, &sl);
+    snprintf(x_port, sizeof(x_port), "%d", ntohs(a.sin_port));
+    return lfd;
+}
+
+static void test_x_sock_connect_bad_port(void)
+{
+    transport_t t; memset(&t, 0, sizeof(t));
+    TEST_ASSERT_NOT_EQUAL(0, sock_connect("127.0.0.1", "99999", &t));
+}
+
+static void test_x_sock_connect_refused(void)
+{
+    transport_t t; memset(&t, 0, sizeof(t));
+    TEST_ASSERT_NOT_EQUAL(0, sock_connect("127.0.0.1", "1", &t));
+}
+
+static void test_x_sock_write_all(void)
+{
+    int lfd = x_listen_port();
+    TEST_ASSERT_GREATER_THAN_INT(-1, lfd);
+
+    transport_t t; memset(&t, 0, sizeof(t));
+    TEST_ASSERT_EQUAL_INT(0, sock_connect("127.0.0.1", x_port, &t));
+    TEST_ASSERT_NOT_NULL(t.write_all);      /* connect must install it */
+
+    int cfd = accept(lfd, NULL, NULL);
+    TEST_ASSERT_GREATER_THAN_INT(-1, cfd);
+
+    const char *msg = "MAIL FROM:<a@b>\r\n";
+    TEST_ASSERT_EQUAL_INT(0, t.write_all(t.ctx, msg, strlen(msg)));
+
+    char got[128];
+    ssize_t n = read(cfd, got, sizeof(got) - 1);
+    TEST_ASSERT_GREATER_THAN_INT(0, (int)n);
+    got[n] = '\0';
+    TEST_ASSERT_EQUAL_STRING(msg, got);
+
+    sock_close(&t);
+    close(cfd);
+    close(lfd);
+}
+
+static void test_x_sock_read_line_reuse(void)
+{
+    int lfd = x_listen_port();
+    TEST_ASSERT_GREATER_THAN_INT(-1, lfd);
+
+    transport_t t; memset(&t, 0, sizeof(t));
+    TEST_ASSERT_EQUAL_INT(0, sock_connect("127.0.0.1", x_port, &t));
+    TEST_ASSERT_NOT_NULL(t.read_line);      /* connect must install it */
+
+    int cfd = accept(lfd, NULL, NULL);
+    TEST_ASSERT_GREATER_THAN_INT(-1, cfd);
+
+    /* One write delivers TWO lines: the first read_line() over-reads
+       into its internal buffer; the second call must be served from
+       that buffer without touching the socket — your cold branch. */
+    const char *chunk = "250-hello\r\n250 ok\r\n";
+    write(cfd, chunk, strlen(chunk));
+
+    char line[128];
+    int r = t.read_line(t.ctx, line, sizeof(line));
+    TEST_ASSERT_GREATER_THAN_INT(0, r);     /* returns length per header */
+    TEST_ASSERT_EQUAL_STRING("250-hello", line);
+    r = t.read_line(t.ctx, line, sizeof(line));
+    TEST_ASSERT_GREATER_THAN_INT(0, r);
+    TEST_ASSERT_EQUAL_STRING("250 ok", line);
+
+    sock_close(&t);
+    close(cfd);
+    close(lfd);
+}
+
+/* Forces the compaction memmove (lines 102-104): pos must cross
+   sizeof(buf)/2, so we stream far more lines than fit in half
+   the buffer through a single connection. */
+static void test_x_sock_read_line_compaction(void)
+{
+    int lfd = x_listen_port();
+    TEST_ASSERT_GREATER_THAN_INT(-1, lfd);
+
+    transport_t t; memset(&t, 0, sizeof(t));
+    TEST_ASSERT_EQUAL_INT(0, sock_connect("127.0.0.1", x_port, &t));
+    TEST_ASSERT_NOT_NULL(t.read_line);
+
+    int cfd = accept(lfd, NULL, NULL);
+    TEST_ASSERT_GREATER_THAN_INT(-1, cfd);
+
+    char flood[4096 * 3];
+    for (int i = 0; i < 4096; i++) {
+        flood[i * 3]     = 'L';
+        flood[i * 3 + 1] = '\r';
+        flood[i * 3 + 2] = '\n';
+    }
+
+    char line[64];
+    int total = 0;
+    for (int round = 0; round < 8; round++) {
+        /* write a batch, then drain exactly that many lines.
+           Interleaving keeps the socket buffer from ever filling. */
+        size_t off = 0;
+        while (off < sizeof(flood)) {
+            ssize_t w = write(cfd, flood + off, sizeof(flood) - off);
+            TEST_ASSERT_GREATER_THAN_INT(0, (int)w);
+            off += (size_t)w;
+        }
+        for (int i = 0; i < 4096; i++) {
+            int r = t.read_line(t.ctx, line, sizeof(line));
+            TEST_ASSERT_GREATER_THAN_INT(0, r);
+            TEST_ASSERT_EQUAL_STRING("L", line);   /* memmove must not corrupt */
+            total++;
+        }
+    }
+    TEST_ASSERT_EQUAL_INT(32768, total);
+
+    sock_close(&t);
+    close(cfd);
+    close(lfd);
 }
 
 /* ===================================================================== */
@@ -666,6 +951,23 @@ int main(void) {
     RUN_TEST(test_sock_connect_refused);
     RUN_TEST(test_sock_connect_bad_host);
     RUN_TEST(test_sock_close_empty_ctx);
+
+    RUN_TEST(test_x_parse_bad);
+    RUN_TEST(test_x_dot_stuff_edges);
+    RUN_TEST(test_x_build_payload_edges);
+    RUN_TEST(test_x_bad_greeting);
+    RUN_TEST(test_x_helo_rejected);
+    RUN_TEST(test_x_mail_rejected);
+    RUN_TEST(test_x_rcpt_rejected);
+    RUN_TEST(test_x_data_rejected);
+    RUN_TEST(test_x_garbage_reply);
+    RUN_TEST(test_x_hangup_mid_session);
+    RUN_TEST(test_x_sock_connect_bad_port);
+    RUN_TEST(test_x_sock_connect_refused);
+    RUN_TEST(test_x_sock_write_all);
+    RUN_TEST(test_x_sock_read_line_reuse);
+
+    RUN_TEST(test_x_sock_read_line_compaction);
 
     return UNITY_END();
 }
