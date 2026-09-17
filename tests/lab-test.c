@@ -96,8 +96,10 @@ static int fake_read_line(void *ctx, char *out, size_t outsz) {
         if (rem >= f->cap) return -1;             /* line longer than buffer */
         size_t left = strlen(f->script) - f->sent;
         if (left == 0) return -1;                 /* EOF: hung up mid-line */
+        size_t room = f->cap - f->end;            /* model recv(): never pull more than fits */
         size_t take = (f->chunk > 0 && (size_t)f->chunk < left)
                           ? (size_t)f->chunk : left;
+        if (take > room) take = room;             /* clamp to free space */
         memcpy(f->buf + f->end, f->script + f->sent, take);
         f->end += take;
         f->sent += take;

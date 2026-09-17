@@ -73,8 +73,7 @@ char *dot_stuff(const char *body, size_t len) {
 
 /* Assembles exactly: headers, blank line, dot-stuffed body, lone '.' terminator.
  * stuffed already ends in "\r\n" (or is empty), so we append just ".\r\n". */
-char *build_data_payload(const char *from, const char *to,
-                         const char *subject, const char *stuffed) {
+char *build_data_payload(const char *from, const char *to, const char *subject, const char *stuffed) {
     size_t need = strlen(from)+strlen(to)+strlen(subject?subject:"")+
                   strlen(stuffed?stuffed:"") + sizeof("From: \r\nTo: \r\nSubject: \r\n\r\n.\r\n");
     char *out = malloc(need);
@@ -189,5 +188,48 @@ int send_command(transport_t *t, const char *cmd, int expected) {
     return 0;
 }
 
-/* ===================== YOUR PART ===================== */
-int run_session(transport_t *t, const mail_cfg_t *cfg) { /* TODO — see below */ (void)t;(void)cfg; return -1; }
+/* ===================== SESSION ===================== */
+int run_session(transport_t *t, const mail_cfg_t *cfg)
+{
+    (void)t;
+    (void)cfg;
+
+//# STEP 1 — greeting: READ ONLY. No command is sent before this.
+    char detail[512];
+    int code = read_reply(t, detail, sizeof detail);
+    if (code < 0) {printf("server hung up during greeting\n");  return -1;}
+    if (code != 220) {fprintf(stderr, "expected 220 but server sent: %s\n", detail); return -1;}
+
+//# STEPS 2–5 — the four commands. Identical shape, so consider a tiny local helper (see below) to keep the free() discipline automatic.
+    char* cmd = cmd_helo(cfg->helo_host);
+    if (send_command(t, cmd, 250) != 0) { free(cmd); return -1;}
+    free(cmd);
+
+    cmd = cmd_mail_from(cfg->from);
+    if (send_command(t, cmd, 250) != 0) { free(cmd); return -1;}
+    free(cmd);
+
+    cmd = cmd_rcpt_to(cfg->to);
+    if (send_command(t, cmd, 250) != 0)  { free(cmd); return -1;}
+    free(cmd);
+
+    // DATA expects 354 — a mode change ("now send bytes"), not completion.
+    if (send_command(t, "DATA\r\n", 354) != 0) return -1;   // cmd_data()
+
+//# STEP 6 — the payload. NOT send_command: this is multi-line data ending in a sentinel, not a command line. Write it raw, then check the reply.
+    char *stuffed = dot_stuff(cfg->body, strlen(cfg->body));
+    if (!stuffed) return -1; // failed malloc
+    char *payload = build_data_payload(cfg->from, cfg->to, cfg->subject, stuffed);
+    free(stuffed); // free immediately, done with it
+    if (!payload) return -1;
+    if (t->write_all(t->ctx, payload, strlen(payload)) != 0) { free(payload); fprintf(stderr, "send failed during DATA\n"); return -1; }
+    free(payload);
+    code = read_reply(t, detail, sizeof detail);  // the "queued" ack
+    if (code < 0) { printf("server hung up after DATA\n"); return -1; }
+    if (code != 250) { fprintf(stderr, "expected 220 but server sent: %s\n", detail); return -1; }
+
+//# STEP 7 — QUIT. Even though the message was queued, a bad final code
+    // # still fails the session (exit 2 territory).
+    if (send_command(t, cmd_quit(), 221) != 0) return -1;
+    return 0;
+}
