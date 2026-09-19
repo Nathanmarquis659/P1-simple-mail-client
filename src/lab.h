@@ -2,15 +2,6 @@
 #define LAB_H
 #include <stddef.h>
 
-/** * @brief Returns a greeting message.
- *
- * This function returns a string that contains a greeting message.
- * The string is allocated with malloc and should be freed by the caller.
- * @param name The name to include in the greeting.
- * @return A greeting string.
- */
-char* get_greeting(const char* restrict name);
-
 /* ---- Layer 1: pure protocol helpers (no I/O) ---- */
 int  parse_reply_code(const char *line);          /* -> 3-digit code, or -1 */
 int  reply_is_final(const char *line);            /* 1 if space-form (final) */
