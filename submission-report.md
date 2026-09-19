@@ -1,6 +1,6 @@
 # Submission Report
 
-- Submission generated at 09/18/2026 at 23:50:07
+- Submission generated at 09/19/2026 at 05:02:18
 
 - Machine info: Linux runnervmlun5p 6.17.0-1022-azure #22-Ubuntu SMP Mon Jul 27 17:24:03 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
 
@@ -25,22 +25,28 @@ Post any questions on the class discussion board for help.
 
 ## Known Bugs or Issues
 
-- **Unhandled malloc failure in command builders.** `cmd_helo`, `cmd_mail_from`, and `cmd_rcpt_to` allocate with `malloc` and return `NULL` on failure; `run_session` passes the result straight to `send_command`, which calls `strlen` on it. A malloc failure there would crash rather than fail cleanly. At these sizes malloc effectively never fails, so severity is low — but a larger version should check for NULL before use.
-- **Message body is read entirely into memory.** When no `-b` file is given, `main` slurps all of stdin into a single buffer before building the payload. Fine for the message sizes in this project; not suitable for very large messages.
-- **HELO only, by design.** Per the assignment, the client speaks plain HELO — there is no EHLO/ESMTP negotiation, TLS, or authentication.
-- **Two cosmetic issues in error reporting.** (a) When the server's reply to `DATA` is not the expected code, the diagnostic prints "expected 250" but should say "expected 354"; (b) the "server hung up after DATA" notification goes to stdout via `printf` rather than stderr. Neither affects protocol correctness.
+- **Unhandled malloc failure in command builders.** `cmd_helo`, `cmd_mail_from`, and `cmd_rcpt_to` allocate with `malloc` 
+and return `NULL` on failure; `run_session` passes the result straight to `send_command`, which calls `strlen` on it. A 
+malloc failure there would crash rather than fail cleanly. At these sizes malloc effectively never fails, so severity is 
+low — but a larger version should check for NULL before use.
+- **Message body is read entirely into memory.** When no `-b` file is given, `main` slurps all of stdin into a single 
+buffer before building the payload. Fine for the message sizes in this project; not suitable for very large messages.
+- **HELO only, by design.** Per the assignment, the client speaks plain HELO. There is no EHLO/ESMTP negotiation, TLS, 
+or authentication.
+- **Two cosmetic issues in error reporting.** (a) When the server's reply to `DATA` is not the expected code, the 
+diagnostic prints "expected 250" but should say "expected 354"; (b) the "server hung up after DATA" notification goes to 
+stdout via `printf` rather than stderr. Neither affects protocol correctness.
 
 ## Experience
 
-The conceptual breakthrough was seeing `transport_t` as a vtable. Once I stopped thinking of it as "a struct with some function pointers" and started reading it as a hand-rolled virtual interface — the callbacks are the virtual functions, `ctx` is the `this` pointer — the fake transport fell out almost for free: implementing the same two callbacks over a string instead of a socket was only a few dozen lines. That single decision is what made the whole test suite possible. Before it I kept asking "how do I mock a socket?"; after, the question became "what string should this scripted server return?"
-
-The protocol details that actually bit me were the three the assignment warned about, all subtle because they fail quietly. Dot stuffing was the worst: forget to double a leading dot and the server sees its end-of-data sentinel and truncates the message with no error code at all — it fails open instead of failing loudly, which is exactly the kind of bug that would be miserable to debug in production. Multi-line replies taught me that "read the reply" means consuming *every* continuation line, not just the first one; stopping after the first `250-` line desyncs the stream and the next read picks up a stray continuation as if it were a new reply. And CRLF framing is easy to get wrong in both directions — emit `\r\n` when sending, strip both bytes when reading.
-
-The most valuable debugging lesson was a segfault that looked like memory corruption but wasn't. I had a crash in `strlen` inside `cmd_helo`, deep in `run_session`, which made me assume something upstream was corrupting memory. The gdb backtrace plus an AddressSanitizer build cracked it: the faulting register held exactly `0x0` — a NULL read, not wild memory — and tracing backward showed `helo_host` was NULL because of a **missing colon after `H` in my getopt string**. Without that colon, `-H` was treated as a flag with no argument, so it never consumed its value and `optarg` held a stale or NULL value. One missing character produced a NULL dereference three functions away. The lesson I'm keeping: trust the register dump over the "it must be corruption" assumption, and when a program crashes but the code looks right, check that you're actually running the code you think you are — a stale build was a real suspect here before ASan ruled it out.
-
-The push for 100% line coverage turned out to be as educational as the client itself. Every branch gcov left cold mapped to a real failure mode I hadn't thought to test: a reply arriving split across multiple `recv`s, two replies arriving in one read (which exercises the buffered-reuse path in the socket reader), a rejected code at each stage of the session, and — the last one — the buffer-compaction `memmove` that only fires after thousands of lines have flowed through a single connection. The trick for Layer 3 was to never touch its private state directly: `sock_connect` installs the callbacks into a `transport_t`, so I could drive the real socket read/write functions over loopback connections through the public interface, exactly as production code does. The compaction test in particular taught me the difference between coverage as a checkbox and coverage as verification: it asserts that all 32,768 lines come back byte-identical, which proves the `memmove` is correct, not merely that it executed.
-
-Overall the project made concrete what I could already do in theory: read an RFC, turn its state machine into code, and structure the code so the protocol logic is testable without the thing it talks to. The three-layer split is now a pattern I'd reuse for any line-oriented text protocol.
+This project was quite challenging for me. I read through the documentation, but my lack of high level C skills hindered
+me the most and was an eye-opener. I had a lot of socket problems at layer 3 when trying to connect to the server because 
+I was writing sloppy code and had been using the opening and closing for each socket properly. When we complied with
+this standard (for the most part) was the most valuable lesson for me, seeing how these protocols are layered and connect
+to each other with extreme care and precision. Faulty implementations are quite easy to make here, and could allow command
+injection if dot stuffing was not properly addressed and considered. Overall this project was a great help in understanding
+networking, although I needed quite a bit of help from AI to get it working 100% and tested. I used a smaller local AI model
+(Qwen3.8-27B) which needed a fair amount of guidance and understanding on my part to get working well, but it turned out well!
 ---
 
 
@@ -611,15 +617,6 @@ int run_session(transport_t *t, const mail_cfg_t *cfg)
 #ifndef LAB_H
 #define LAB_H
 #include <stddef.h>
-
-/** * @brief Returns a greeting message.
- *
- * This function returns a string that contains a greeting message.
- * The string is allocated with malloc and should be freed by the caller.
- * @param name The name to include in the greeting.
- * @return A greeting string.
- */
-char* get_greeting(const char* restrict name);
 
 /* ---- Layer 1: pure protocol helpers (no I/O) ---- */
 int  parse_reply_code(const char *line);          /* -> 3-digit code, or -1 */
@@ -1750,14 +1747,14 @@ int main(void) {
 ```
 
 ## Scripts Files
-Report generated on 09/18/2026 at 23:50:08
+Report generated on 09/19/2026 at 05:02:20
 
 
 ---
 
 ## End of Report
 
-SHA-256 Hash of the report: fcfacd58f5e4a244b56212b5016f0821248d5e5cf2fdae07a9f7a2e0945db053
+SHA-256 Hash of the report: 3c60a4bfe9f6cc264ffde237027b30a0350e079de8e27e0664aacd6ec4387046
 
 Do not edit the generated report. Any changes will be reported as academic dishonesty
 
